@@ -35,7 +35,7 @@ from sample_factory.utils.decay import LinearDecay
 from sample_factory.utils.timing import Timing
 from sample_factory.utils.utils import log, AttrDict, experiment_dir, ensure_dir_exists, join_or_kill, safe_get, safe_put
 # our imports
-from sample_factory.algorithms.appo.gail_model import create_gail
+from sample_factory.algorithms.appo.gail_model import GailDiscriminator
 
 # noinspection PyPep8Naming
 def _build_pack_info_from_dones(dones: torch.Tensor, T: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -462,10 +462,14 @@ class LearnerWorker:
                 buffer.rewards += self.cfg.max_entropy_coeff * entropies  # [E, T]
 
         # add gail rewards 
-        if self.use_gail:
+        if self.cfg.use_gail:
             with timing.add_time('add_gail_rew'):
-                obs = buffer.obs # TODO: check that obs is the correct key!
-                buffer.rewards += self.cfg.gail_rew_coef * self.aux_loss_module.predict_reward(obs)
+                obs = buffer.obs["obs"] # [E, T, O]
+                obs = obs.reshape((-1, obs.shape[-1])) # [E*T, O]
+                obs = torch.Tensor(obs).to(self.device)
+                gail_rewards = self.aux_loss_module.predict_reward(obs).cpu().numpy()
+                gail_rewards = gail_rewards.reshape((-1, self.cfg.rollout)) # [E, T]
+                buffer.rewards += self.cfg.gail_rew_coef * gail_rewards
 
         if not self.cfg.with_vtrace:
             with timing.add_time('calc_gae'):
@@ -651,7 +655,11 @@ class LearnerWorker:
             'optimizer': self.optimizer.state_dict(),
         }
         if self.aux_loss_module is not None:
-            checkpoint['aux_loss_module'] = self.aux_loss_module.state_dict()
+            if self.cfg.use_gail:
+                checkpoint['discriminator'] = self.aux_loss_module.state_dict()
+                checkpoint['aux_optimizer'] = self.aux_optimizer.state_dict()
+            else:
+                checkpoint['aux_loss_module'] = self.aux_loss_module.state_dict()                
 
         return checkpoint
 
@@ -797,9 +805,10 @@ class LearnerWorker:
             if not self.with_training:
                 return stats_and_summaries
 
-        # GAIL UPDATE
+        # update gail
         if self.aux_loss_module is not None:
             for g_epoch in range(self.cfg.gail_epochs):
+                minibatches = self._get_minibatches(batch_size, experience_size)
                 for g_batch_num in range(len(minibatches)):
                     with timing.add_time('minibatch_init'):
                         indices = minibatches[g_batch_num] # generate the indices of the minibatch
@@ -809,38 +818,35 @@ class LearnerWorker:
                     with torch.no_grad():
                         # ignore experience from other agents (i.e. on episode boundary) and from inactive agents
                         g_valids = mb.policy_id == self.policy_id
-
                         # ignore experience that was older than the threshold even before training started
                         g_valids = g_valids & (policy_version_before_train - mb.policy_version < self.cfg.max_policy_lag)
-                    '''
-                    TODO: 
-                    check valid mb (see PPO data)
-                    pass mb to the GAIL update function!
-                    sample expert data and pass to GAIL update 
 
-                    '''
                     with timing.add_time('gail_losses'):
                         # TODO: sample expert obs from demonstration dataset
-                        agent_obs = mb.obs
-                        expert_obs = None
+                        agent_obs = mb.obs["obs"]
+                        expert_obs = mb.obs["obs"]  # DEBUG ONLY
 
-                        # TODO: confirm that masking obs rather than loss is okay
-                        agent_obs = torch.masked_select(agent_obs, g_valids)
-                        expert_obs = torch.masked_select(expert_obs, g_valids)
-
-                        # TODO: add logging for losses!
                         gail_loss, gail_grad_norm, gail_grad_pen, gail_policy_disc_pred, gail_expert_disc_pred = self.aux_loss_module.update(agent_obs, expert_obs)
 
+                        gail_loss = torch.masked_select(gail_loss, g_valids).mean()
+                        gail_grad_pen = torch.masked_select(gail_grad_pen, g_valids).mean()
+                        # statistics to log
+                        gail_grad_norm = torch.masked_select(gail_grad_norm, g_valids).mean().item()
+                        gail_policy_disc_pred = torch.masked_select(gail_policy_disc_pred, g_valids).mean().item()
+                        gail_expert_disc_pred = torch.masked_select(gail_expert_disc_pred, g_valids).mean().item()
+
+
+                    with timing.add_time('update_gail'):
                         # following advice from https://youtu.be/9mS1fIYj1So set grad to None instead of optimizer.zero_grad()
                         for p in self.aux_loss_module.parameters():
                             p.grad = None
-
-                        g_loss = (gail_loss + gail_grad_pen).mean()
-
-                        g_loss.backward()
+                        (gail_loss + gail_grad_pen).backward()
                         with self.policy_lock:
-                            self.g_optimizer.step()
-                        
+                            self.aux_optimizer.step()
+                        # statistics to log
+                        gail_loss = gail_loss.item()
+                        gail_grad_pen = gail_grad_pen.item()
+
 
         for epoch in range(self.cfg.ppo_epochs):
             with timing.add_time('epoch_init'):
@@ -963,7 +969,7 @@ class LearnerWorker:
 
                     loss = actor_loss + critic_loss
 
-                    # TODO: check that removing this is okay! 
+                    # TODO: experiment with shared encoder with GAIL
                     # if self.aux_loss_module is not None:
                     #     with timing.add_time('aux_loss'):
                     #         aux_loss = self.aux_loss_module(
@@ -1008,7 +1014,7 @@ class LearnerWorker:
                     if self.cfg.max_grad_norm > 0.0:
                         with timing.add_time('clip'):
                             torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.cfg.max_grad_norm)
-                            # TODO: do we need to clip grad norm for GAIL learner?
+                            # TODO: expt with clipping grad norm for GAIL learner?
                             # if self.aux_loss_module is not None:
                             #     torch.nn.utils.clip_grad_norm_(self.aux_loss_module.parameters(), self.cfg.max_grad_norm)
 
@@ -1080,7 +1086,13 @@ class LearnerWorker:
         stats.value_loss = var.value_loss
         stats.exploration_loss = var.exploration_loss
         if self.aux_loss_module is not None:
-            stats.aux_loss = var.aux_loss
+            if self.cfg.use_gail:
+                stats.gail_loss = var.gail_loss
+                stats.gail_grad_pen = var.gail_grad_pen
+                stats.gail_grad_norm = var.gail_grad_norm
+                stats.gail_policy_disc_pred = var.gail_policy_disc_pred
+                stats.gail_expert_disc_pred = var.gail_expert_disc_pred
+
         stats.adv_min = var.adv.min()
         stats.adv_max = var.adv.max()
         stats.adv_std = var.adv_std
@@ -1168,14 +1180,17 @@ class LearnerWorker:
                     log.exception(f'Could not load from checkpoint, attempt {attempt}')
 
     def _load_state(self, checkpoint_dict, load_progress=True):
-        # TODO: load gail?
         if load_progress:
             self.train_step = checkpoint_dict['train_step']
             self.env_steps = checkpoint_dict['env_steps']
         self.actor_critic.load_state_dict(checkpoint_dict['model'])
         self.optimizer.load_state_dict(checkpoint_dict['optimizer'])
         if self.aux_loss_module is not None:
-            self.aux_loss_module.load_state_dict(checkpoint_dict['aux_loss_module'])
+            if self.cfg.use_gail:
+                self.aux_loss_module.load_state_dict(checkpoint_dict['discriminator'])
+                self.aux_optimizer.load_state_dict(checkpoint_dict['aux_optimizer'])
+            else:
+                self.aux_loss_module.load_state_dict(checkpoint_dict['aux_loss_module'])
         log.info('Loaded experiment state at training iteration %d, env step %d', self.train_step, self.env_steps)
 
     def init_model(self, timing):
@@ -1185,7 +1200,7 @@ class LearnerWorker:
         # if self.cfg.use_cpc:
             # self.aux_loss_module = CPCA(self.cfg, self.action_space)
         if self.cfg.use_gail:
-            self.aux_loss_module = GailDiscriminator(self.cfg, input_dim=self.obs_space, device=self.device) # TODO: add args
+            self.aux_loss_module = GailDiscriminator(self.cfg, obs_space=self.obs_space, device=self.device) # TODO: add args
 
         if self.aux_loss_module is not None:
             self.aux_loss_module.to(device=self.device)

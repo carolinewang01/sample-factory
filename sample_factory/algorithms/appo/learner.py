@@ -807,6 +807,7 @@ class LearnerWorker:
 
         # update gail
         if self.aux_loss_module is not None:
+            
             for g_epoch in range(self.cfg.gail_epochs):
                 minibatches = self._get_minibatches(batch_size, experience_size)
                 for g_batch_num in range(len(minibatches)):

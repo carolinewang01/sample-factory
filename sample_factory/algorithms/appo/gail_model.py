@@ -39,47 +39,7 @@ class GailDiscriminator(nn.Module):
             nn.Linear(self.cfg.hidden_size, 1)).to(self.device)
 
         self.trunk.train()
-
-        # self.optimizer = th.optim.Adam(self.trunk.parameters())
-
-        # self.ret_rms = RunningMeanStd(shape=())
-        # self.returns = None
-
-        # self.obs_info = obs_info
-
         self.agent_idx = agent_idx
-
-        # self.agent_storage = BatchStorage(cfg, buffer_size=max_buffer_eps, obs_info=obs_info)
-        # if self.cfg.gail_sil:
-        #     self.expert_storage = PriorityBatchStorage(cfg, buffer_size=max_buffer_eps)
-        #     self.discount = th.tensor([self.cfg.gamma**i for i in range(self.cfg.episode_limit+1)]).to(self.device)
-        # else:
-        # self.expert_storage = BatchStorage(cfg, epath=epath, 
-            # obs_info=obs_info, 
-            # agent_idx=agent_idx)
-
-
-    # def add_agent_data(self, obses, actions):
-    #     '''Store an episode of data'''
-    #     self.agent_storage.store_ep(obses, actions)
-
-    # def add_sil_expert_data(self, obses, actions, rewards):
-    #     '''Store an episode of data for self-imitation learning'''        
-    #     batch_size, ep_len, _ = rewards.shape # shape (batch_size, ep_len, 1)
-    #     assert batch_size==1       
-    #     ep_ret = th.tensordot(self.discount[:ep_len], rewards, dims=([0], [1]))[0, 0].cpu().tolist()
-    #     self.expert_storage.store_ep(obses, actions, ep_ret)
-
-    # def save_agent_data(self, name):
-    #     self.agent_storage.save(name)
-
-    # def flush(self):
-    #     self.agent_storage.reset()
-
-    # def can_sample(self):
-    #     if self.cfg.gail_sil:
-    #         return self.agent_storage.can_sample() and self.expert_storage.can_sample()
-    #     return self.agent_storage.can_sample()
 
     def compute_grad_pen(self,
                          expert_in,
@@ -105,8 +65,6 @@ class GailDiscriminator(nn.Module):
         grad_pen = lambda_ * grad_norm
         return grad_pen, grad_norm
 
-    # TODO: adapt GAIL learner update function to accept APPO obs format
-    # def update(self, batch, expert_batch): 
     def update(self, agent_obs, expert_obs): 
         self.train()
         loss = 0
@@ -114,13 +72,6 @@ class GailDiscriminator(nn.Module):
         grad_pen_all = 0
         policy_disc_pred_all = 0
         expert_disc_pred_all = 0
-
-        # pol_obs = th.cat([batch[i]['obs'] for i in range(len(batch))]) # shape (batch_size, ep_limit, obs_size)
-        # expert_obs = th.cat([expert_batch[i]['obs'] for i in range(len(expert_batch))]).to(self.device)
-
-        # collapse timesteps and episodes dim
-        # agent_obs = agent_obs.reshape(-1, agent_obs.shape[-1]) # shape (batch_size*ep_limit, pol_obs.shape[-1])
-        # expert_obs = expert_obs.reshape(-1, expert_obs.shape[-1])
 
         policy_in = agent_obs
         expert_in = expert_obs
@@ -151,15 +102,7 @@ class GailDiscriminator(nn.Module):
 
         policy_disc_pred_all += th.sigmoid(policy_d)
         expert_disc_pred_all += th.sigmoid(expert_d)
-        # policy_disc_pred_all += th.mean(th.sigmoid(policy_d)).item()
-        # expert_disc_pred_all += th.mean(th.sigmoid(expert_d)).item()
 
-        # self.optimizer.zero_grad()
-        # (gail_loss + grad_pen).backward()
-        # self.optimizer.step()
-
-        # return loss / n, grad_norm_all / n, grad_pen_all / n, \
-        # policy_disc_pred_all / n, expert_disc_pred_all / n
         return loss, grad_norm_all, grad_pen_all, \
         policy_disc_pred_all, expert_disc_pred_all 
 

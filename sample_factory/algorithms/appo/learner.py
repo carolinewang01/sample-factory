@@ -36,6 +36,7 @@ from sample_factory.utils.timing import Timing
 from sample_factory.utils.utils import log, AttrDict, experiment_dir, ensure_dir_exists, join_or_kill, safe_get, safe_put
 # our imports
 from sample_factory.algorithms.appo.gail_model import GailDiscriminator
+from sample_factory.algorithms.appo.model_utils import create_dataloader
 
 # noinspection PyPep8Naming
 def _build_pack_info_from_dones(dones: torch.Tensor, T: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -260,6 +261,9 @@ class LearnerWorker:
 
         self.cfg = cfg
 
+        if self.cfg.use_gail: # set to None for now, initialize inside training loop
+            self.expert_dataloader = None
+
         # PBT-related stuff
         self.should_save_model = True  # set to true if we need to save the model to disk on the next training iteration
         self.load_policy_id = None  # non-None when we need to replace our parameters with another policy's parameters
@@ -464,7 +468,7 @@ class LearnerWorker:
         # add gail rewards 
         if self.cfg.use_gail:
             with timing.add_time('add_gail_rew'):
-                obs = buffer.obs["obs"] # [E, T, O]
+                obs = buffer.obs["obs"] # [E, T, O] [num_ep=359, ep_limit=20, obs_shape=13479]
                 obs = obs.reshape((-1, obs.shape[-1])) # [E*T, O]
                 obs = torch.Tensor(obs).to(self.device)
                 gail_rewards = self.aux_loss_module.predict_reward(obs).cpu().numpy()
@@ -823,9 +827,12 @@ class LearnerWorker:
                         g_valids = g_valids & (policy_version_before_train - mb.policy_version < self.cfg.max_policy_lag)
 
                     with timing.add_time('gail_losses'):
-                        # TODO: sample expert obs from demonstration dataset
                         agent_obs = mb.obs["obs"]
-                        expert_obs = mb.obs["obs"]  # DEBUG ONLY
+                        obj, expert_obs, expert_act = next(self.expert_dataloader) 
+                        expert_obs = expert_obs.to(self.device)
+                        # expert_obs = mb.obs["obs"]  # DEBUG ONLY
+                        # print("AGENT OBS SHAPE IS ", agent_obs.shape) # [ep_limit*num_ep=7180, obs_feats=13470]
+                        # print("EXPERT OBS SHAPE IS ", expert_obs.shape) # [ep_limit*num_ep=7180, obs_feats=13470]
 
                         gail_loss, gail_grad_norm, gail_grad_pen, gail_policy_disc_pred, gail_expert_disc_pred = self.aux_loss_module.update(agent_obs, expert_obs)
 
@@ -1236,7 +1243,7 @@ class LearnerWorker:
                 torch.backends.cudnn.benchmark = True
 
                 # we should already see only one CUDA device, because of env vars
-                assert torch.cuda.device_count() == 1
+                assert torch.cuda.device_count() == 1, f"True device count: {torch.cuda.device_count()}"
                 self.device = torch.device('cuda', index=0)
             else:
                 self.device = torch.device('cpu')
@@ -1278,6 +1285,11 @@ class LearnerWorker:
         experience_size = buffer.rewards.shape[0]
 
         stats = dict(learner_env_steps=self.env_steps, policy_id=self.policy_id)
+
+        if self.cfg.use_gail: # TODO: clean this up
+            if self.expert_dataloader is None:
+                log.info("Creating expert dataloader...")
+                self.expert_dataloader = create_dataloader(self.cfg)
 
         with timing.add_time('train'):
             discarding_rate = self._discarding_rate()

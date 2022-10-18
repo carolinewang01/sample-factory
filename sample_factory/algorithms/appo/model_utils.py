@@ -13,7 +13,18 @@ from sample_factory.utils.utils import log
 
 # register custom encoders
 ENCODER_REGISTRY = dict()
+DATALOADER_REGISTRY = dict()
 
+# TODO: move dataloader code to a better place
+def register_custom_dataloader(custom_dataloader_name, dataloader):
+    if custom_dataloader_name in DATALOADER_REGISTRY:
+        log.warning('Dataloader %s already registered', custom_dataloader_name)
+    DATALOADER_REGISTRY[custom_dataloader_name] = dataloader
+
+def create_dataloader(cfg):
+    dataloader_constr = DATALOADER_REGISTRY[cfg.dataloader_name]
+    dataloader = iter(dataloader_constr(batch_size=cfg.batch_size))
+    return dataloader
 
 def register_custom_encoder(custom_encoder_name, encoder_cls):
     if custom_encoder_name in ENCODER_REGISTRY:

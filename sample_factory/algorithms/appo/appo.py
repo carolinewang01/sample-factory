@@ -47,7 +47,6 @@ else:
     # noinspection PyUnresolvedReferences
     import faster_fifo_reduction
 
-
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 

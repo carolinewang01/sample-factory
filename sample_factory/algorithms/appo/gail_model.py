@@ -50,7 +50,7 @@ class GailDiscriminator(nn.Module):
 
         mixup_data = alpha * expert_in + (1 - alpha) * policy_in
         mixup_data.requires_grad = True
-
+        
         disc = self.trunk(mixup_data)
         ones = th.ones(disc.size()).to(disc.device)
         grad = autograd.grad(

@@ -16,7 +16,7 @@ import psutil
 import torch
 from torch.nn.utils.rnn import PackedSequence, invert_permutation
 from torch.multiprocessing import Process, Event as MultiprocessingEvent
-
+import pdb
 if os.name == 'nt':
     from sample_factory.utils import Queue as MpQueue
 else:
@@ -252,7 +252,7 @@ def get_lr_scheduler(cfg) -> LearningRateScheduler:
 class LearnerWorker:
     def __init__(
         self, worker_idx, policy_id, cfg, obs_space, action_space, report_queue, policy_worker_queues, shared_buffers,
-        policy_lock, resume_experience_collection_cv,
+        policy_lock, resume_experience_collection_cv, # expert_dataloader=None
     ):
         log.info('Initializing the learner %d for policy %d', worker_idx, policy_id)
 
@@ -471,6 +471,7 @@ class LearnerWorker:
                 obs = buffer.obs["obs"] # [E, T, O] [num_ep=359, ep_limit=20, obs_shape=13479]
                 obs = obs.reshape((-1, obs.shape[-1])) # [E*T, O]
                 obs = torch.Tensor(obs).to(self.device)
+                obs = obs / 10
                 gail_rewards = self.aux_loss_module.predict_reward(obs).cpu().numpy()
                 gail_rewards = gail_rewards.reshape((-1, self.cfg.rollout)) # [E, T]
                 buffer.rewards += self.cfg.gail_rew_coef * gail_rewards
@@ -827,13 +828,12 @@ class LearnerWorker:
                         g_valids = g_valids & (policy_version_before_train - mb.policy_version < self.cfg.max_policy_lag)
 
                     with timing.add_time('gail_losses'):
-                        agent_obs = mb.obs["obs"]
-                        obj, expert_obs, expert_act = next(self.expert_dataloader) 
+                        agent_obs = mb.obs["obs"] # [ep_limit*num_ep=7180, obs_feats=13470]
+                        obj, expert_obs = next(self.expert_dataloader)  # obs shape: [ep_limit*num_ep=7180, obs_feats=13470]
                         expert_obs = expert_obs.to(self.device)
                         # expert_obs = mb.obs["obs"]  # DEBUG ONLY
-                        # print("AGENT OBS SHAPE IS ", agent_obs.shape) # [ep_limit*num_ep=7180, obs_feats=13470]
-                        # print("EXPERT OBS SHAPE IS ", expert_obs.shape) # [ep_limit*num_ep=7180, obs_feats=13470]
-
+                        agent_obs /= 10
+                        expert_obs /= 10
                         gail_loss, gail_grad_norm, gail_grad_pen, gail_policy_disc_pred, gail_expert_disc_pred = self.aux_loss_module.update(agent_obs, expert_obs)
 
                         gail_loss = torch.masked_select(gail_loss, g_valids).mean()
@@ -842,7 +842,6 @@ class LearnerWorker:
                         gail_grad_norm = torch.masked_select(gail_grad_norm, g_valids).mean().item()
                         gail_policy_disc_pred = torch.masked_select(gail_policy_disc_pred, g_valids).mean().item()
                         gail_expert_disc_pred = torch.masked_select(gail_expert_disc_pred, g_valids).mean().item()
-
 
                     with timing.add_time('update_gail'):
                         # following advice from https://youtu.be/9mS1fIYj1So set grad to None instead of optimizer.zero_grad()
@@ -921,7 +920,22 @@ class LearnerWorker:
                     if self.cfg.with_vtrace:
                         ratios_cpu = ratio.cpu()
                         values_cpu = values.cpu()
+                        if torch.isnan(values_cpu).any():
+                            print("VALUES ARE NAN")
+                            pdb.set_trace()
+
+                        if torch.isinf(values_cpu).any():
+                            print("VALUES ARE INF")
+                            pdb.set_trace()
+
                         rewards_cpu = mb.rewards_cpu
+                        if torch.isnan(rewards_cpu).any():
+                            print("REWS ARE NAN")
+                            pdb.set_trace()
+                        if torch.isinf(rewards_cpu).any():
+                            print("REWS ARE INF")
+                            pdb.set_trace()
+
                         dones_cpu = mb.dones_cpu
 
                         vtrace_rho = torch.min(rho_hat, ratios_cpu)
@@ -932,6 +946,13 @@ class LearnerWorker:
 
                         next_values = (values_cpu[recurrence - 1::recurrence] - rewards_cpu[recurrence - 1::recurrence]) / gamma
                         next_vs = next_values
+                        if torch.isnan(next_vs).any():
+                            print("NEXT VALUES ARE NAN")
+                            pdb.set_trace()
+
+                        if torch.isinf(next_vs).any():
+                            print("NEXT VALUES ARE INF")
+                            pdb.set_trace()
 
                         with timing.add_time('vtrace'):
                             for i in reversed(range(self.cfg.recurrence)):
@@ -963,17 +984,53 @@ class LearnerWorker:
                     adv = adv.to(self.device)
 
                 with timing.add_time('losses'):
-                    policy_loss = self._policy_loss(ratio, adv, clip_ratio_low, clip_ratio_high, valids)
-                    exploration_loss = self.exploration_loss_func(action_distribution, valids)
-                    kl_loss = self.kl_loss_func(self.actor_critic.action_space, mb.action_logits, action_distribution, valids)
 
+                    policy_loss = self._policy_loss(ratio, adv, clip_ratio_low, clip_ratio_high, valids)
+                    if torch.isnan(policy_loss).any():
+                        print("RATIO", ratio)
+                        print("ADV", adv)
+                        print("ADV MEAN IS ", adv_mean)
+                        print("ADV STD IS ", adv_std)
+
+                        print("CLIP RATIO LOW ", clip_ratio_low)
+                        print("CLIP RATIO HIGH ", clip_ratio_high)
+                        pdb.set_trace()
+
+                    if torch.isinf(policy_loss).any():
+                        print("RATIO", ratio)
+                        print("ADV", adv)
+                        print("CLIP RATIO LOW ", clip_ratio_low)
+                        print("CLIP RATIO HIGH ", clip_ratio_high)
+                        pdb.set_trace()
+
+                    exploration_loss = self.exploration_loss_func(action_distribution, valids)
+                    assert not torch.isnan(exploration_loss).any()
+                    assert not torch.isinf(exploration_loss).any()
+
+                    kl_loss = self.kl_loss_func(self.actor_critic.action_space, mb.action_logits, action_distribution, valids)
+                    
                     actor_loss = policy_loss + exploration_loss + kl_loss
+
                     epoch_actor_losses.append(actor_loss.item())
 
                     targets = targets.to(self.device)
                     old_values = mb.values
                     value_loss = self._value_loss(values, old_values, targets, clip_value, valids)
+
                     critic_loss = value_loss
+                    if torch.isnan(critic_loss).any():
+                        print("OLD VALUES NAN", torch.isnan(old_values).any())
+                        print("VALUES NAN", torch.isnan(values).any())
+                        print("TARGETS NAN", torch.isnan(targets).any())
+                        print("CLIP VALUE NAN", torch.isnan(clip_value).any())
+                        pdb.set_trace()
+
+                    if torch.isinf(critic_loss).any():
+                        print("OLD VALUES INF", torch.isinf(old_values).any())
+                        print("VALUES INF", torch.isinf(values).any())
+                        print("TARGETS INF", torch.isinf(targets).any())
+                        print("CLIP VALUE INF", torch.isinf(clip_value).any())
+                        pdb.set_trace()
 
                     loss = actor_loss + critic_loss
 
@@ -1105,7 +1162,6 @@ class LearnerWorker:
         stats.adv_max = var.adv.max()
         stats.adv_std = var.adv_std
         stats.max_abs_logprob = torch.abs(var.mb.action_logits).max()
-        # TODO: add GAIL logging here
 
         if hasattr(var.action_distribution, 'summaries'):
             stats.update(var.action_distribution.summaries())
@@ -1286,10 +1342,12 @@ class LearnerWorker:
 
         stats = dict(learner_env_steps=self.env_steps, policy_id=self.policy_id)
 
-        if self.cfg.use_gail: # TODO: clean this up
+        if self.cfg.use_gail: # create dataloader here to ensure that it is created in same thread
             if self.expert_dataloader is None:
                 log.info("Creating expert dataloader...")
-                self.expert_dataloader = create_dataloader(self.cfg)
+                if self.device!="cuda:0":
+                    print("DEVICE IS ", self.device)
+                self.expert_dataloader = create_dataloader(self.cfg, device=self.device)
 
         with timing.add_time('train'):
             discarding_rate = self._discarding_rate()

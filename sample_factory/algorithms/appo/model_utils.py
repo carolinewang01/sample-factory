@@ -21,9 +21,9 @@ def register_custom_dataloader(custom_dataloader_name, dataloader):
         log.warning('Dataloader %s already registered', custom_dataloader_name)
     DATALOADER_REGISTRY[custom_dataloader_name] = dataloader
 
-def create_dataloader(cfg):
+def create_dataloader(cfg, device):
     dataloader_constr = DATALOADER_REGISTRY[cfg.dataloader_name]
-    dataloader = iter(dataloader_constr(batch_size=cfg.batch_size))
+    dataloader = iter(dataloader_constr(batch_size=cfg.batch_size, device=device))
     return dataloader
 
 def register_custom_encoder(custom_encoder_name, encoder_cls):
